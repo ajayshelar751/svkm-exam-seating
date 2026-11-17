@@ -379,6 +379,16 @@
             <button onclick="applyBulkLayout()" class="bg-indigo-700 hover:bg-indigo-600 text-white px-3 py-1 rounded font-semibold text-xs">Apply</button>
           </div>
         </div>
+        <!-- Multi-Program Single Bench Option (Option A: Auto-Single when Benches >= Students, Block-Contiguous) -->
+        <div class="mb-3 p-3 rounded border border-emerald-300 bg-emerald-50/70 flex flex-wrap items-center justify-between gap-3">
+          <label class="flex items-start sm:items-center space-x-2.5 cursor-pointer text-xs sm:text-sm text-slate-800">
+            <input type="checkbox" id="autoSingleBenchToggle" checked onchange="toggleAutoSingleBench(this.checked)" class="mt-0.5 sm:mt-0 h-4 w-4 rounded accent-emerald-700 cursor-pointer">
+            <span>
+              <b class="text-emerald-950">Single Student per Bench when Benches &ge; Students (Block-Contiguous):</b>
+              When a room has at least as many benches as total candidates in a session, seat <b>1 student per bench</b> sequentially by Block / Program instead of pairing two different programs side-by-side (automatically falls back to paired seating if candidates exceed benches).
+            </span>
+          </label>
+        </div>
         <!-- Optional: upload room layouts from Excel (works alongside manual entry below) -->
         <div class="mb-3 p-3 rounded border border-indigo-300 bg-indigo-50 flex flex-wrap items-center justify-between gap-3">
           <div class="max-w-2xl">
@@ -725,6 +735,7 @@
   <script>
     // ---------- State ----------
     const GENDER_COLORS_KEY = 'portal_gender_colors_enabled';
+    const AUTO_SINGLE_BENCH_KEY = 'portal_auto_single_bench_enabled';
     let scheduleRows = [];
     let roomStats = {};
     let roomLayouts = {};
@@ -744,6 +755,24 @@
       if (c1) c1.checked = enabled;
       if (c2) c2.checked = enabled;
       renderDoorCharts();
+    }
+
+    function isAutoSingleBenchEnabled() {
+      const saved = localStorage.getItem(AUTO_SINGLE_BENCH_KEY);
+      if (saved === null) return true;
+      return saved === 'true';
+    }
+
+    function toggleAutoSingleBench(enabled) {
+      localStorage.setItem(AUTO_SINGLE_BENCH_KEY, String(enabled));
+      const chk = document.getElementById('autoSingleBenchToggle');
+      if (chk) chk.checked = enabled;
+      if (scheduleRows.length) {
+        recomputeRoomStats();
+        renderRoomSetup();
+        updateOverview();
+        if (masterAllocation.length) executeAllocation(true);
+      }
     }
     let masterAllocation = [];
     let sessionsMeta = [];
@@ -1106,7 +1135,14 @@
     });
 
     // ---------- Schedule -> sessions & room stats ----------
-    function sessionKey(r) { return `${r.ExamDate}|${r.StartTime}|${r.EndTime}|${r.Room}`; }
+    // Group physical room sessions by ExamDate + StartTime + Room so exams starting together with different end times
+    // (e.g. 11:30-12:30 and 11:30-13:30 in the same room) never overlap on the same benches.
+    function sessionKey(r) { return `${r.ExamDate}|${r.StartTime}|${r.Room}`; }
+
+    function formatEndTimes(endTimes) {
+      const u = [...new Set((endTimes || []).map(t => String(t || '').trim()).filter(Boolean))].sort();
+      return u.join(' / ');
+    }
 
     function dedupeStudents(list) {
       const map = new Map();
@@ -1119,6 +1155,9 @@
           if (!e.ModuleCode.split(', ').includes(s.ModuleCode)) {
             e.ModuleCode += ', ' + s.ModuleCode;
             e.ModuleDescription += ', ' + s.ModuleDescription;
+          }
+          if (s.EndTime && !String(e.EndTime || '').split(' / ').includes(s.EndTime)) {
+            e.EndTime = e.EndTime ? `${e.EndTime} / ${s.EndTime}` : s.EndTime;
           }
           if (s.IsPWD) { e.IsPWD = true; e.Category = e.Category || s.Category; }
           if (s.IsCancelled) { e.IsCancelled = true; e.StudentStatus = 'Admission Cancelled'; e.StudentRemark = 'Cancel'; }
@@ -1883,7 +1922,7 @@
           : `<span class="bg-[#c82333] text-white px-2 py-0.5 rounded text-xs font-bold border border-red-800">Debarred</span>`;
         const exclNote = excludeSpecialStatus ? `<div class="text-[11px] text-slate-600 font-semibold mt-0.5">Excluded from seating</div>` : '';
 
-        const blk = studentBlockIndex[`${s.ExamDate}|${s.StartTime}|${s.EndTime}|${s.Room}|${s.RollNo}`] || '-';
+        const blk = studentBlockIndex[`${s.ExamDate}|${s.StartTime}|${s.EndTime}|${s.Room}|${s.RollNo}`] || studentBlockIndex[`${s.ExamDate}|${s.StartTime}|${s.Room}|${s.RollNo}`] || '-';
 
         html += `
           <tr class="hover:bg-slate-50 ${s.IsCancelled ? 'bg-slate-200' : ''}">
@@ -2063,16 +2102,33 @@
       }
       const limitHeights = spreadMode ? spreadHeights : frontHeights;
 
+      // Total physical units (benches/chairs) in this room
+      const totalRoomUnits = colRows.reduce((a, b) => a + b, 0);
+      // Option A: Auto-Single when Benches >= Students (Block-Contiguous)
+      const useSingleContiguous = isAutoSingleBenchEnabled() && totalRoomUnits >= students.length;
+
       // Students of one PROGRAM never share a bench (even for different subjects / semesters).
-      const names = [...new Set(students.map(s => s.ProgramName))].sort(natCompare);
+      // In Block-Contiguous single-bench mode, order programs by their Block sequence number so Block 1 is seated first, then Block 2, etc.
+      const progMinSeq = {};
+      students.forEach(s => {
+        const sq = s.BlockSeq || 9999;
+        if (progMinSeq[s.ProgramName] === undefined || sq < progMinSeq[s.ProgramName]) progMinSeq[s.ProgramName] = sq;
+      });
+      const names = [...new Set(students.map(s => s.ProgramName))].sort((a, b) =>
+        useSingleContiguous ? ((progMinSeq[a] - progMinSeq[b]) || natCompare(a, b)) : natCompare(a, b)
+      );
 
       // level 2 = PWD students keep at least one empty bench around them (also diagonally);
       // level 1 = at least one empty bench in front / behind / beside them (no diagonal rule).
-      function runWalk(level, sticky, benches) {
+      function runWalk(level, sticky, benches, singleContiguous) {
         const q = {};
         const allPwd = [];
         names.forEach(p => {
-          const mine = students.filter(s => s.ProgramName === p).sort((a, b) => natCompare(a.RollNo, b.RollNo));
+          const mine = students.filter(s => s.ProgramName === p).sort((a, b) =>
+            singleContiguous
+              ? (((a.BlockSeq || 0) - (b.BlockSeq || 0)) || natCompare(a.RollNo, b.RollNo))
+              : natCompare(a.RollNo, b.RollNo)
+          );
           q[p] = { reg: mine.filter(s => !s.IsPWD), pwd: mine.filter(s => s.IsPWD) };
           allPwd.push(...q[p].pwd);
         });
@@ -2124,11 +2180,27 @@
 
           if (b.isChair) {
             // Chair unit: 1 student per seat.
-            const byRem = takeable.slice().sort((a, b) => rem(b) - rem(a) || natCompare(a, b));
-            const Lp = byRem.find(p => !last || p !== last[0]) || byRem[0];
+            let Lp;
+            if (singleContiguous) {
+              Lp = takeable[0];
+            } else {
+              const byRem = takeable.slice().sort((a, b) => rem(b) - rem(a) || natCompare(a, b));
+              Lp = byRem.find(p => !last || p !== last[0]) || byRem[0];
+            }
             const s1 = q[Lp].pwd.length && ok ? q[Lp].pwd.shift() : takeReg(Lp);
             if (s1 && s1.IsPWD) pwdBenches.push(b);
             placements.push({ bi, L: s1, R: null, pair: [Lp, null], isChair: true });
+            last = [Lp, null];
+            return;
+          }
+
+          if (singleContiguous) {
+            // Option A: Auto-Single when Benches >= Students (Block-Contiguous)
+            // Seat 1 student per bench on the Left side sequentially by Program/Block, leaving Right vacant.
+            const Lp = takeable[0];
+            const sL = q[Lp].pwd.length && ok ? q[Lp].pwd.shift() : takeReg(Lp);
+            if (sL && sL.IsPWD) pwdBenches.push(b);
+            placements.push({ bi, L: sL, R: null, pair: [Lp, null], isChair: false });
             last = [Lp, null];
             return;
           }
@@ -2155,29 +2227,36 @@
       const passes = [[2, true], [2, false], [1, true], [1, false]];
       const fullBenches = serpentine(colRows);
 
-      // Pass 0: how many units does the whole room need? (lower bound for the front-first search)
-      let seed = null;
-      for (const [level, sticky] of passes) {
-        const res = runWalk(level, sticky, fullBenches);
-        if (!seed || res.unplaced.length < seed.unplaced.length) seed = res;
-        if (!res.unplaced.length) break;
-      }
-      const usedUnits = seed.placements.filter(pl => pl.L || pl.R).length;
-
-      let best = null, activeBenches = fullBenches;
-      if (!seed.unplaced.length) {
-        // Use the smallest front block of rows that seats everybody (and honours the PWD gap rule at the
-        // strictest level possible); everything behind it is left vacant.
-        search:
+      function solveWithMode(singleMode) {
+        let seed = null;
         for (const [level, sticky] of passes) {
-          for (let K = Math.max(1, usedUnits); K <= fullBenches.length; K++) {
-            const bl = serpentine(limitHeights(K));
-            const res = runWalk(level, sticky, bl);
-            if (!res.unplaced.length) { best = res; activeBenches = bl; break search; }
+          const res = runWalk(level, sticky, fullBenches, singleMode);
+          if (!seed || res.unplaced.length < seed.unplaced.length) seed = res;
+          if (!res.unplaced.length) break;
+        }
+        const usedUnits = seed.placements.filter(pl => pl.L || pl.R).length;
+        let best = null, activeBenches = fullBenches;
+        if (!seed.unplaced.length) {
+          search:
+          for (const [level, sticky] of passes) {
+            for (let K = Math.max(1, usedUnits); K <= fullBenches.length; K++) {
+              const bl = serpentine(limitHeights(K));
+              const res = runWalk(level, sticky, bl, singleMode);
+              if (!res.unplaced.length) { best = res; activeBenches = bl; break search; }
+            }
           }
         }
+        if (!best) { best = seed; activeBenches = fullBenches; }
+        return { best, activeBenches };
       }
-      if (!best) { best = seed; activeBenches = fullBenches; }   // room too small: report what could not be seated
+
+      let solved = solveWithMode(useSingleContiguous);
+      // Graceful fallback: if single-bench mode left anyone unplaced (e.g. due to PWD buffer constraints), fallback to paired seating
+      if (useSingleContiguous && solved.best.unplaced.length > 0) {
+        const fallback = solveWithMode(false);
+        if (fallback.best.unplaced.length < solved.best.unplaced.length) solved = fallback;
+      }
+      let { best, activeBenches } = solved;
 
       // Seat list = used front block (in serpentine order) followed by the vacant remainder of the room.
       const activeSet = new Set(activeBenches.map(b => b.r + '-' + b.c));
@@ -2210,9 +2289,11 @@
 
       const blockStyle = document.getElementById('blockNumberingSelect')?.value || 'arabic';
 
+      // Group slots by ExamDate + StartTime so exams starting at the same time in the same room
+      // (even with different EndTimes, e.g. 11:30-12:30 and 11:30-13:30) are allocated together on one unified room grid.
       const slots = {};
       scheduleRows.forEach(r => {
-        const slotKey = `${r.ExamDate}|${r.StartTime}|${r.EndTime}`;
+        const slotKey = `${r.ExamDate}|${r.StartTime}`;
         (slots[slotKey] = slots[slotKey] || []).push(r);
       });
 
@@ -2277,7 +2358,8 @@
 
         sortedRooms.forEach(room => {
           const list = roomMap[room];
-          const { ExamDate, StartTime, EndTime, Room } = list[0];
+          const { ExamDate, StartTime, Room } = list[0];
+          const EndTime = formatEndTimes(list.map(r => r.EndTime));
           const colRows = getColRows(roomLayouts[Room]);
           const allStudents = roomStudentsMap[Room];
 
@@ -2289,7 +2371,8 @@
             s.Block = blkInfo.label;
             s.BlockNum = blkInfo.num;
             s.BlockSeq = blkInfo.seq;
-            studentBlockIndex[`${ExamDate}|${StartTime}|${EndTime}|${Room}|${s.RollNo}`] = s.Block;
+            studentBlockIndex[`${ExamDate}|${StartTime}|${s.EndTime}|${Room}|${s.RollNo}`] = s.Block;
+            studentBlockIndex[`${ExamDate}|${StartTime}|${Room}|${s.RollNo}`] = s.Block;
           });
 
           // Candidates actually seated: Cancelled / Debarred are left out when the "Exclude from seating" option is on
@@ -2314,7 +2397,7 @@
             (isUnitChair ? [['Seat', pl.L]] : [['Left', pl.L], ['Right', pl.R]]).forEach(([side, s]) => {
               const isFem = !!(s && s.IsFemale);
               masterAllocation.push({
-                ExamDate, StartTime, EndTime, RoomNo: Room,
+                ExamDate, StartTime, EndTime: s ? (s.EndTime || EndTime) : EndTime, SessionEndTime: EndTime, RoomNo: Room,
                 Block: s ? s.Block : '',
                 BlockNum: s ? s.BlockNum : '',
                 BlockSeq: s ? s.BlockSeq : 0,
@@ -2380,7 +2463,7 @@
               room: Room,
               date: ExamDate,
               startTime: StartTime,
-              endTime: EndTime,
+              endTime: formatEndTimes(pStudents.map(s => s.EndTime)) || EndTime,
               colRows: colRows
             };
           });
@@ -2399,7 +2482,7 @@
           });
 
           sessionsMeta.push({
-            key: `${ExamDate}|${StartTime}|${EndTime}|${Room}`,
+            key: `${ExamDate}|${StartTime}|${Room}`,
             ExamDate, StartTime, EndTime, RoomNo: Room, colRows, colTypes,
             seating: layType,
             semester: distinctSemesters,
@@ -2494,7 +2577,7 @@
       roomSelect.onchange = render2DVisualizer;
     }
 
-    const seatsOf = sess => masterAllocation.filter(m => m.ExamDate === sess.ExamDate && m.StartTime === sess.StartTime && m.EndTime === sess.EndTime && m.RoomNo === sess.RoomNo);
+    const seatsOf = sess => masterAllocation.filter(m => m.ExamDate === sess.ExamDate && m.StartTime === sess.StartTime && m.RoomNo === sess.RoomNo);
 
     // ---------- 2D Hall Grid ----------
     function render2DVisualizer() {
@@ -2659,10 +2742,11 @@
           if (dCount) remParts.push(`Debarred: ${dCount} (${g.filter(s => s.IsDebarred).map(s => s.RollNo).join(', ')})`);
           if (pCount) remParts.push(`PWD: ${pCount}`);
 
+          const blkEndTime = formatEndTimes(g.map(s => s.EndTime)) || sess.EndTime;
           rows.push({
             ExamDate: sess.ExamDate,
             StartTime: sess.StartTime,
-            EndTime: sess.EndTime,
+            EndTime: blkEndTime,
             RoomNo: sess.RoomNo,
             Block: g[0].Block || defaultBlockLabel(),
             BlockNum: g[0].BlockNum || defaultBlockNum(),
@@ -2857,7 +2941,7 @@
     // Consolidated Notice Board Door Plan
     function createConsolidatedDoorPlanElement(date, ss) {
       const summaryRows = buildSummaryRows(date);
-      const times = [...new Set(ss.map(s => `${s.StartTime} - ${s.EndTime}`))].join(', ');
+      const times = [...new Set(summaryRows.map(r => `${r.StartTime} - ${r.EndTime}`))].join(', ');
       const semChip = semChipText(summaryRows.map(s => s.AcademicSession));
       const examMonth = [...new Set(summaryRows.map(s => s.ExamMonthYear).filter(Boolean))].join(', ') || 'October, 2026';
       const acadYear = [...new Set(summaryRows.map(s => s.AcademicYearFormatted).filter(Boolean))].join(', ') || '2026-27';
@@ -3064,6 +3148,7 @@
           ${esc(b.program)} <b style="white-space:nowrap">(Sem ${esc(semRoman(b.semester))})</b>
           <b style="white-space:nowrap">&ndash; ${b.count}</b> <small style="white-space:nowrap">[M: ${b.maleCount}, F: ${b.femaleCount}]</small>
           <small style="white-space:nowrap">&middot; ${esc(b.firstRoll)} - ${esc(b.lastRoll)}</small>
+          ${sess.EndTime.includes('/') && b.endTime ? `<small style="white-space:nowrap;font-weight:700">&middot; (${esc(b.startTime)}-${esc(b.endTime)})</small>` : ''}
           ${b.cancelledCount ? `<small style="color:#ffffff;background:#334155;padding:1px 4px;border-radius:3px;font-weight:800">[Cancel: ${b.cancelledCount}]</small>` : ''}
           ${b.debarredCount ? `<small style="color:#ffffff;background:#c82333;padding:1px 4px;border-radius:3px;font-weight:800">[Debarred: ${b.debarredCount}]</small>` : ''}
         </div>`).join(' ');
@@ -3215,7 +3300,7 @@
             </div>
             <div class="row">
               <div><b>REGULAR EXAM:</b> ${esc(blk.examMonthYear)}</div>
-              <div style="white-space:nowrap"><b>EXAM TIME:</b> ${sess.StartTime} TO ${sess.EndTime}</div>
+              <div style="white-space:nowrap"><b>EXAM TIME:</b> ${blk.startTime || sess.StartTime} TO ${blk.endTime || sess.EndTime}</div>
             </div>
             <div class="row">
               <div><b>SUBJECT:</b> ${esc((blk.subjects && blk.subjects.length ? blk.subjects : [`${blk.moduleCode} - ${blk.moduleDesc}`]).join('; '))}</div>
@@ -3479,6 +3564,8 @@
       const c2 = document.getElementById('enableGenderColorsPdfTab6');
       if (c1) c1.checked = initialGenderColors;
       if (c2) c2.checked = initialGenderColors;
+      const autoSingleChk = document.getElementById('autoSingleBenchToggle');
+      if (autoSingleChk) autoSingleChk.checked = isAutoSingleBenchEnabled();
     })();
   </script>
 </body>
