@@ -1170,18 +1170,26 @@
     }
 
     // One block = one unique Program + Academic Session (Semester) + Subject (Module Description) combination.
-    // (Used for block numbers only. Seating separation is by PROGRAM: students of one program never share a bench,
-    //  even when they sit different subjects.)
     function blockKeyOf(s) {
       const desc = String(s.ModuleDescription || '').replace(/\s+/g, ' ').trim().toUpperCase();
       return `${s.ProgramName}||${cleanSemester(s.AcademicSession)}||${desc}`;
     }
 
+    // Seating cohort key: students with the same Program + Subject (ModuleCode / ModuleDescription) never share a bench,
+    // while students from different Programs OR writing different elective/open-elective subjects can sit side-by-side.
+    function seatCohortKeyOf(s) {
+      const mod = String(s.ModuleCode || s.ModuleDescription || '').replace(/\s+/g, ' ').trim().toUpperCase();
+      return `${s.ProgramName}||${mod}`;
+    }
+
     function minBenchesFor(students) {
-      const byProg = {};
-      students.forEach(s => { byProg[s.ProgramName] = (byProg[s.ProgramName] || 0) + 1; });
-      const maxProg = Math.max(0, ...Object.values(byProg));
-      return Math.max(maxProg, Math.ceil(students.length / 2));
+      const byCohort = {};
+      students.forEach(s => {
+        const k = seatCohortKeyOf(s);
+        byCohort[k] = (byCohort[k] || 0) + 1;
+      });
+      const maxCohort = Math.max(0, ...Object.values(byCohort));
+      return Math.max(maxCohort, Math.ceil(students.length / 2));
     }
 
     // Room capacity needs; candidates who are excluded from seating (Cancelled / Debarred) are not counted.
@@ -2107,15 +2115,17 @@
       // Option A: Auto-Single when Benches >= Students (Block-Contiguous)
       const useSingleContiguous = isAutoSingleBenchEnabled() && totalRoomUnits >= students.length;
 
-      // Students of one PROGRAM never share a bench (even for different subjects / semesters).
-      // In Block-Contiguous single-bench mode, order programs by their Block sequence number so Block 1 is seated first, then Block 2, etc.
-      const progMinSeq = {};
+      // Students in the same seating cohort (same Program + same Subject/Module) never share a bench,
+      // while students from different Programs or writing different subjects (e.g. Open Electives) can be paired.
+      // In Block-Contiguous single-bench mode, order cohorts by their Block sequence number so Block 1 is seated first, then Block 2, etc.
+      const cohortMinSeq = {};
       students.forEach(s => {
+        const ck = seatCohortKeyOf(s);
         const sq = s.BlockSeq || 9999;
-        if (progMinSeq[s.ProgramName] === undefined || sq < progMinSeq[s.ProgramName]) progMinSeq[s.ProgramName] = sq;
+        if (cohortMinSeq[ck] === undefined || sq < cohortMinSeq[ck]) cohortMinSeq[ck] = sq;
       });
-      const names = [...new Set(students.map(s => s.ProgramName))].sort((a, b) =>
-        useSingleContiguous ? ((progMinSeq[a] - progMinSeq[b]) || natCompare(a, b)) : natCompare(a, b)
+      const names = [...new Set(students.map(seatCohortKeyOf))].sort((a, b) =>
+        useSingleContiguous ? ((cohortMinSeq[a] - cohortMinSeq[b]) || natCompare(a, b)) : natCompare(a, b)
       );
 
       // level 2 = PWD students keep at least one empty bench around them (also diagonally);
@@ -2124,7 +2134,7 @@
         const q = {};
         const allPwd = [];
         names.forEach(p => {
-          const mine = students.filter(s => s.ProgramName === p).sort((a, b) =>
+          const mine = students.filter(s => seatCohortKeyOf(s) === p).sort((a, b) =>
             singleContiguous
               ? (((a.BlockSeq || 0) - (b.BlockSeq || 0)) || natCompare(a.RollNo, b.RollNo))
               : natCompare(a.RollNo, b.RollNo)
